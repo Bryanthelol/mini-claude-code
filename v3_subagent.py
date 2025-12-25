@@ -33,7 +33,7 @@ except Exception as exc:
 
 ANTHROPIC_BASE_URL = "https://api.moonshot.cn/anthropic"
 ANTHROPIC_API_KEY = (
-    "sk-HBfTVqsZ4dmrb3QvQIqoycTD0CGxUYT3QCP0Ui5ZYw9pQNqY"  # Replace with your API key
+    "sk-abx"  # Replace with your API key
 )
 AGENT_MODEL = "kimi-k2-turbo-preview"
 
