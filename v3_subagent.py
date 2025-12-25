@@ -1,464 +1,177 @@
 #!/usr/bin/env python3
 """
-v3_subagent.py - Minimal Subagent Implementation
+v3_subagent.py - Mini Claude Code: + Subagent Mechanism (~450 lines)
 
-This version adds Task tool support, demonstrating how Claude Code's subagent
-mechanism works with ~150 lines of new code. Key concepts:
+Builds on v2 by adding the Task tool for spawning subagents.
+This solves "context pollution": exploration details don't clutter the main conversation.
 
-1. AGENT_TYPES: Registry defining agent capabilities and tool access
-2. Task tool: Spawns child agents with isolated message history
-3. Tool filtering: Each agent type has its own tool whitelist
-4. Recursive query: Subagents reuse the same query() loop
+New concepts:
+- AGENT_TYPES: Registry defining agent capabilities
+- Task tool: Spawns isolated child agents
+- Tool filtering: Each agent type has its own tool whitelist
+- Recursive query: Subagents reuse the same loop
 
-The subagent pattern enables:
-- Parallel exploration (multiple read-only agents)
-- Separation of concerns (explore vs implement)
-- Cost optimization (use cheaper models for simple tasks)
+Usage:
+    python v3_subagent.py
 """
 
-import json
-import re
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 try:
     from anthropic import Anthropic
-except Exception as exc:
-    sys.stderr.write("Install with: pip install anthropic\n")
-    raise exc
+except ImportError:
+    sys.exit("pip install anthropic")
 
-ANTHROPIC_BASE_URL = "https://api.moonshot.cn/anthropic"
-ANTHROPIC_API_KEY = (
-    "sk-abx"  # Replace with your API key
-)
-AGENT_MODEL = "kimi-k2-turbo-preview"
-
+# =============================================================================
+# Configuration
+# =============================================================================
+API_KEY = "sk-xxx"  # Replace with your API key
+BASE_URL = "https://api.moonshot.cn/anthropic"
+MODEL = "claude-sonnet-4-20250514"
 WORKDIR = Path.cwd()
-MAX_TOOL_RESULT_CHARS = 100_000
-TODO_STATUSES = ("pending", "in_progress", "completed")
 
-RESET = "\x1b[0m"
-PRIMARY_COLOR = "\x1b[38;2;120;200;255m"
-ACCENT_COLOR = "\x1b[38;2;150;140;255m"
-INFO_COLOR = "\x1b[38;2;110;110;110m"
-PROMPT_COLOR = "\x1b[38;2;120;200;255m"
-SUBAGENT_COLOR = "\x1b[38;2;255;180;100m"
-TODO_PENDING_COLOR = "\x1b[38;2;176;176;176m"
-TODO_PROGRESS_COLOR = "\x1b[38;2;120;200;255m"
-TODO_COMPLETED_COLOR = "\x1b[38;2;34;139;34m"
+client = Anthropic(api_key=API_KEY, base_url=BASE_URL) if BASE_URL else Anthropic(api_key=API_KEY)
 
-MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
-MD_CODE = re.compile(r"`([^`]+)`")
-MD_HEADING = re.compile(r"^(#{1,6})\s*(.+)$", re.MULTILINE)
-MD_BULLET = re.compile(r"^\s*[-\*]\s+", re.MULTILINE)
-
-
-# ============================================================================
-# SUBAGENT PROGRESS TRACKER - Kode-style inline progress display
-# ============================================================================
-class SubagentProgress:
-    """
-    Manages subagent output display in Kode style:
-    - Shows a single progress line that updates in place
-    - Collects tool calls for summary
-    - Does NOT pollute main chat area
-    """
-
-    def __init__(self, agent_type: str, description: str):
-        self.agent_type = agent_type
-        self.description = description
-        self.tool_calls: List[str] = []
-        self.start_time = time.time()
-        self._last_line_len = 0
-
-    def update(self, tool_name: str, tool_arg: str | None = None) -> None:
-        """Record a tool call and update the progress line."""
-        display = f"{tool_name}({tool_arg})" if tool_arg else tool_name
-        self.tool_calls.append(display)
-        self._render_progress()
-
-    def _render_progress(self) -> None:
-        """Render the current progress line (overwrites previous)."""
-        elapsed = time.time() - self.start_time
-        count = len(self.tool_calls)
-        last_tool = self.tool_calls[-1] if self.tool_calls else "starting..."
-
-        # Truncate last_tool if too long
-        max_tool_len = 40
-        if len(last_tool) > max_tool_len:
-            last_tool = last_tool[: max_tool_len - 3] + "..."
-
-        line = f"{INFO_COLOR}  | {last_tool} (+{count} tool uses, {elapsed:.1f}s){RESET}"
-
-        # Clear previous line and write new one
-        sys.stdout.write("\r" + " " * self._last_line_len + "\r")
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        self._last_line_len = len(line) + 10  # Account for ANSI codes
-
-    def finish(self) -> str:
-        """Finalize and return summary line."""
-        elapsed = time.time() - self.start_time
-        count = len(self.tool_calls)
-
-        # Clear the progress line
-        sys.stdout.write("\r" + " " * self._last_line_len + "\r")
-        sys.stdout.flush()
-
-        # Return summary
-        return f"{INFO_COLOR}  | completed: {count} tool calls in {elapsed:.1f}s{RESET}"
-
-
-# Global reference for current subagent progress (if any)
-_current_subagent_progress: SubagentProgress | None = None
-
-
-# ============================================================================
-# AGENT TYPE REGISTRY - Core of subagent mechanism
-# ============================================================================
-# Each agent type defines:
-# - description: When to use this agent (shown in Task tool prompt)
-# - tools: List of allowed tools ("*" = all tools)
-# - system_prompt: Agent-specific instructions
-# ============================================================================
-AGENT_TYPES: Dict[str, Dict[str, Any]] = {
+# =============================================================================
+# Agent Type Registry - Core of the subagent mechanism
+# =============================================================================
+AGENT_TYPES = {
     "explore": {
-        "description": "Fast read-only agent for exploring codebases, finding files, and searching code",
-        "tools": ["bash", "read_file"],  # Read-only tools only
-        "system_prompt": (
-            "You are an exploration agent. Your job is to quickly search and understand code.\n"
-            "Rules:\n"
-            "- Only use read-only operations (bash for grep/find/ls, read_file)\n"
-            "- Never modify files\n"
-            "- Return a concise, structured summary of findings\n"
-            "- Focus on answering the specific question asked"
-        ),
+        "description": "Read-only agent for exploring code, finding files, searching",
+        "tools": ["bash", "read_file"],  # No write access
+        "prompt": "You are an exploration agent. Search and analyze, but never modify files. Return a concise summary.",
     },
     "code": {
-        "description": "Full-featured coding agent for implementing features, fixing bugs, and refactoring",
-        "tools": "*",  # All tools available
-        "system_prompt": (
-            "You are a coding agent. Implement the requested changes efficiently.\n"
-            "Rules:\n"
-            "- Make minimal, focused changes\n"
-            "- Test your changes when possible\n"
-            "- Report what was changed concisely"
-        ),
+        "description": "Full agent for implementing features and fixing bugs",
+        "tools": "*",  # All tools
+        "prompt": "You are a coding agent. Implement the requested changes efficiently.",
     },
     "plan": {
-        "description": "Planning agent for designing implementation strategies before coding",
-        "tools": ["bash", "read_file"],  # Read-only for analysis
-        "system_prompt": (
-            "You are a planning agent. Analyze the codebase and design implementation plans.\n"
-            "Rules:\n"
-            "- Read relevant files to understand the codebase\n"
-            "- Output a numbered step-by-step plan\n"
-            "- Identify key files that need changes\n"
-            "- Do NOT make any changes yourself"
-        ),
+        "description": "Planning agent for designing implementation strategies",
+        "tools": ["bash", "read_file"],  # Read-only
+        "prompt": "You are a planning agent. Analyze the codebase and output a numbered implementation plan. Do NOT make changes.",
     },
 }
 
 
 def get_agent_descriptions() -> str:
-    """Generate agent type descriptions for Task tool prompt."""
+    """Generate descriptions for Task tool."""
     lines = []
     for name, config in AGENT_TYPES.items():
-        tools = config["tools"] if config["tools"] != "*" else "All tools"
-        lines.append(f"- {name}: {config['description']} (Tools: {tools})")
+        lines.append(f"- {name}: {config['description']}")
     return "\n".join(lines)
 
 
-# ============================================================================
-# Utility functions (same as v2)
-# ============================================================================
-def clear_screen() -> None:
-    if sys.stdout.isatty():
-        sys.stdout.write("\033c")
-        sys.stdout.flush()
-
-
-def render_banner(title: str, subtitle: str | None = None) -> None:
-    print(f"{PRIMARY_COLOR}{title}{RESET}")
-    if subtitle:
-        print(f"{ACCENT_COLOR}{subtitle}{RESET}")
-    print()
-
-
-def user_prompt_label() -> str:
-    return f"{ACCENT_COLOR}{RESET} {PROMPT_COLOR}User{RESET}{INFO_COLOR} >> {RESET}"
-
-
-def format_markdown(text: str) -> str:
-    if not text or text.lstrip().startswith("\x1b"):
-        return text
-
-    def bold_repl(m):
-        return f"\x1b[1m{m.group(1)}\x1b[0m"
-
-    def code_repl(m):
-        return f"\x1b[38;2;255;214;102m{m.group(1)}\x1b[0m"
-
-    def heading_repl(m):
-        return f"\x1b[1m{m.group(2)}\x1b[0m"
-
-    formatted = MD_BOLD.sub(bold_repl, text)
-    formatted = MD_CODE.sub(code_repl, formatted)
-    formatted = MD_HEADING.sub(heading_repl, formatted)
-    formatted = MD_BULLET.sub("- ", formatted)
-    return formatted
-
-
-def safe_path(path_value: str) -> Path:
-    abs_path = (WORKDIR / str(path_value or "")).resolve()
-    if not abs_path.is_relative_to(WORKDIR):
-        raise ValueError("Path escapes workspace")
-    return abs_path
-
-
-def clamp_text(text: str, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n...<truncated {len(text) - limit} chars>"
-
-
-def pretty_tool_line(kind: str, title: str | None, indent: int = 0) -> None:
-    prefix = "  " * indent
-    body = f"{kind}({title})..." if title else kind
-    glow = f"{ACCENT_COLOR}\x1b[1m"
-    print(f"{prefix}{glow}@ {body}{RESET}")
-
-
-def pretty_sub_line(text: str, indent: int = 0) -> None:
-    prefix = "  " * indent
-    for line in text.splitlines() or [""]:
-        print(f"{prefix}  | {format_markdown(line)}")
-
-
-class Spinner:
-    def __init__(self, label: str = "Waiting for model") -> None:
-        self.label = label
-        self.frames = ["@", "@@", "@@@", "@@", "@"]
-        self.color = "\x1b[38;2;255;229;92m"
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if not sys.stdout.isatty() or self._thread:
-            return
-        self._stop.clear()
-
-        def run():
-            start = time.time()
-            i = 0
-            while not self._stop.is_set():
-                elapsed = time.time() - start
-                sys.stdout.write(
-                    f"\r{self.color}{self.frames[i % len(self.frames)]} {self.label} ({elapsed:.1f}s)\x1b[0m"
-                )
-                sys.stdout.flush()
-                i += 1
-                time.sleep(0.15)
-
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if not self._thread:
-            return
-        self._stop.set()
-        self._thread.join(timeout=1)
-        self._thread = None
-        sys.stdout.write("\r\x1b[2K")
-        sys.stdout.flush()
-
-
-def block_to_dict(block: Any) -> Dict[str, Any]:
-    if isinstance(block, dict):
-        return block
-    result = {}
-    for key in ("type", "text", "id", "name", "input"):
-        if hasattr(block, key):
-            result[key] = getattr(block, key)
-    return result
-
-
-def normalize_content_list(content: Any) -> List[Dict[str, Any]]:
-    try:
-        return [block_to_dict(item) for item in (content or [])]
-    except Exception:
-        return []
-
-
-# ============================================================================
-# API Client
-# ============================================================================
-api_key = ANTHROPIC_API_KEY
-if not api_key:
-    sys.stderr.write("ANTHROPIC_API_KEY not set\n")
-    sys.exit(1)
-
-client = Anthropic(api_key=api_key, base_url=ANTHROPIC_BASE_URL)
-
-
-# ============================================================================
-# System Prompt
-# ============================================================================
-SYSTEM = (
-    f"You are a coding agent operating INSIDE the user's repository at {WORKDIR}.\n"
-    "Follow this loop: plan briefly -> use TOOLS to act -> report results.\n\n"
-    "Rules:\n"
-    "- Prefer taking actions with tools over long prose\n"
-    "- Use the Task tool to spawn subagents for complex subtasks\n"
-    "- Use TodoWrite to track multi-step work\n"
-    "- After finishing, summarize what changed\n\n"
-    f"Available agent types for Task tool:\n{get_agent_descriptions()}"
-)
-
-
-# ============================================================================
-# TodoManager (same as v2)
-# ============================================================================
+# =============================================================================
+# TodoManager (from v2)
+# =============================================================================
 class TodoManager:
-    def __init__(self) -> None:
-        self.items: List[Dict[str, str]] = []
+    def __init__(self):
+        self.items = []
 
-    def update(self, items: List[Dict[str, Any]]) -> str:
-        if not isinstance(items, list):
-            raise ValueError("Todo items must be a list")
-        cleaned, seen_ids, in_progress = [], set(), 0
-        for i, raw in enumerate(items):
-            if not isinstance(raw, dict):
-                raise ValueError("Each todo must be an object")
-            tid = str(raw.get("id") or i + 1)
-            if tid in seen_ids:
-                raise ValueError(f"Duplicate todo id: {tid}")
-            seen_ids.add(tid)
-            content = str(raw.get("content") or "").strip()
-            if not content:
-                raise ValueError("Todo content cannot be empty")
-            status = str(raw.get("status") or "pending").lower()
-            if status not in TODO_STATUSES:
-                raise ValueError(f"Invalid status: {status}")
+    def update(self, items: list) -> str:
+        validated = []
+        in_progress = 0
+
+        for i, item in enumerate(items):
+            content = str(item.get("content", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            active = str(item.get("activeForm", "")).strip()
+
+            if not content or not active:
+                raise ValueError(f"Item {i}: content and activeForm required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {i}: invalid status")
             if status == "in_progress":
                 in_progress += 1
-            active_form = str(raw.get("activeForm") or "").strip()
-            if not active_form:
-                raise ValueError("activeForm cannot be empty")
-            cleaned.append(
-                {
-                    "id": tid,
-                    "content": content,
-                    "status": status,
-                    "active_form": active_form,
-                }
-            )
-            if len(cleaned) > 20:
-                raise ValueError("Max 20 todos")
+
+            validated.append({"content": content, "status": status, "activeForm": active})
+
         if in_progress > 1:
             raise ValueError("Only one task can be in_progress")
-        self.items = cleaned
+
+        self.items = validated[:20]
         return self.render()
 
     def render(self) -> str:
         if not self.items:
-            return f"{TODO_PENDING_COLOR}[ ] No todos{RESET}"
+            return "No todos."
         lines = []
         for t in self.items:
-            mark = "[x]" if t["status"] == "completed" else "[ ]"
-            if t["status"] == "completed":
-                lines.append(f"{TODO_COMPLETED_COLOR}{mark} {t['content']}{RESET}")
-            elif t["status"] == "in_progress":
-                lines.append(f"{TODO_PROGRESS_COLOR}{mark} {t['content']}{RESET}")
-            else:
-                lines.append(f"{TODO_PENDING_COLOR}{mark} {t['content']}{RESET}")
-        return "\n".join(lines)
-
-    def stats(self) -> Dict[str, int]:
-        return {
-            "total": len(self.items),
-            "completed": sum(t["status"] == "completed" for t in self.items),
-            "in_progress": sum(t["status"] == "in_progress" for t in self.items),
-        }
+            mark = "[x]" if t["status"] == "completed" else "[>]" if t["status"] == "in_progress" else "[ ]"
+            lines.append(f"{mark} {t['content']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        return "\n".join(lines) + f"\n({done}/{len(self.items)} done)"
 
 
-TODO_BOARD = TodoManager()
+TODO = TodoManager()
 
+# =============================================================================
+# System Prompt
+# =============================================================================
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
 
-# ============================================================================
-# TOOL DEFINITIONS
-# ============================================================================
+Loop: plan -> act with tools -> report.
+
+You can spawn subagents for complex subtasks:
+{get_agent_descriptions()}
+
+Rules:
+- Use Task tool for subtasks that need focused exploration or implementation
+- Use TodoWrite to track multi-step work
+- Prefer tools over prose. Act, don't just explain.
+- After finishing, summarize what changed."""
+
+# =============================================================================
+# Base Tool Definitions
+# =============================================================================
 BASE_TOOLS = [
     {
         "name": "bash",
-        "description": "Execute a shell command in the workspace.",
+        "description": "Run shell command.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command"},
-                "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000},
-            },
+            "properties": {"command": {"type": "string"}},
             "required": ["command"],
         },
     },
     {
         "name": "read_file",
-        "description": "Read a UTF-8 text file.",
+        "description": "Read file contents.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "start_line": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer"},
-            },
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
             "required": ["path"],
         },
     },
     {
         "name": "write_file",
-        "description": "Create or overwrite a UTF-8 text file.",
+        "description": "Write to file.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-                "mode": {"type": "string", "enum": ["overwrite", "append"]},
-            },
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"],
         },
     },
     {
-        "name": "edit_text",
-        "description": "Small, precise text edits (replace/insert/delete_range).",
+        "name": "edit_file",
+        "description": "Replace text in file.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "action": {
-                    "type": "string",
-                    "enum": ["replace", "insert", "delete_range"],
-                },
-                "find": {"type": "string"},
-                "replace": {"type": "string"},
-                "insert_after": {"type": "integer"},
+                "old_text": {"type": "string"},
                 "new_text": {"type": "string"},
-                "range": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
             },
-            "required": ["path", "action"],
+            "required": ["path", "old_text", "new_text"],
         },
     },
     {
         "name": "TodoWrite",
-        "description": "Update the shared todo list.",
+        "description": "Update task list.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -467,12 +180,11 @@ BASE_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
                             "content": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
                             "activeForm": {"type": "string"},
-                            "status": {"type": "string", "enum": list(TODO_STATUSES)},
                         },
-                        "required": ["content", "activeForm", "status"],
+                        "required": ["content", "status", "activeForm"],
                     },
                 }
             },
@@ -481,414 +193,254 @@ BASE_TOOLS = [
     },
 ]
 
-# ============================================================================
-# TASK TOOL - The subagent spawning mechanism
-# ============================================================================
+# Task tool - for spawning subagents
 TASK_TOOL = {
     "name": "Task",
-    "description": (
-        "Launch a subagent to handle a specific task autonomously.\n\n"
-        f"Available agent types:\n{get_agent_descriptions()}\n\n"
-        "The subagent runs in isolation with its own message history, "
-        "executes tools as needed, and returns its final response."
-    ),
+    "description": f"Spawn a subagent for a focused subtask.\n\nAgent types:\n{get_agent_descriptions()}",
     "input_schema": {
         "type": "object",
         "properties": {
-            "description": {
-                "type": "string",
-                "description": "Short task description (3-5 words)",
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Detailed instructions for the subagent",
-            },
-            "subagent_type": {
-                "type": "string",
-                "description": f"Agent type: {', '.join(AGENT_TYPES.keys())}",
-                "enum": list(AGENT_TYPES.keys()),
-            },
+            "description": {"type": "string", "description": "Short task description (3-5 words)"},
+            "prompt": {"type": "string", "description": "Detailed instructions for the subagent"},
+            "agent_type": {"type": "string", "enum": list(AGENT_TYPES.keys())},
         },
-        "required": ["description", "prompt", "subagent_type"],
+        "required": ["description", "prompt", "agent_type"],
     },
 }
 
-# Full tool list for main agent (includes Task)
+# Main agent gets all tools including Task
 ALL_TOOLS = BASE_TOOLS + [TASK_TOOL]
 
 
-def get_tools_for_agent(agent_type: str) -> List[Dict[str, Any]]:
-    """Filter tools based on agent type configuration."""
-    if agent_type not in AGENT_TYPES:
-        return BASE_TOOLS  # Fallback
-
-    allowed = AGENT_TYPES[agent_type]["tools"]
+def get_tools_for_agent(agent_type: str) -> list:
+    """Filter tools based on agent type."""
+    allowed = AGENT_TYPES.get(agent_type, {}).get("tools", "*")
     if allowed == "*":
-        return BASE_TOOLS  # Subagents don't get Task tool (no recursion in demo)
-
+        return BASE_TOOLS  # Subagents don't get Task (no nesting in demo)
     return [t for t in BASE_TOOLS if t["name"] in allowed]
 
 
-# ============================================================================
-# TOOL EXECUTORS
-# ============================================================================
-def run_bash(inp: Dict[str, Any]) -> str:
-    cmd = str(inp.get("command") or "")
-    if not cmd:
-        raise ValueError("missing command")
-    if any(x in cmd for x in ["rm -rf /", "shutdown", "reboot", "sudo "]):
-        raise ValueError("blocked dangerous command")
-    timeout = int(inp.get("timeout_ms") or 30000) / 1000.0
-    proc = subprocess.run(
-        cmd,
-        cwd=str(WORKDIR),
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return clamp_text("\n".join([proc.stdout, proc.stderr]).strip() or "(no output)")
+# =============================================================================
+# Tool Implementations
+# =============================================================================
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 
 
-def run_read(inp: Dict[str, Any]) -> str:
-    fp = safe_path(inp.get("path"))
-    text = fp.read_text("utf-8")
-    lines = text.split("\n")
-    start = max(0, int(inp.get("start_line") or 1) - 1)
-    end = int(inp.get("end_line") or len(lines))
-    if end < 0:
-        end = len(lines)
-    return clamp_text("\n".join(lines[start:end]))
+def run_bash(cmd: str) -> str:
+    if any(d in cmd for d in ["rm -rf /", "sudo", "shutdown"]):
+        return "Error: Dangerous command"
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=60)
+        return ((r.stdout + r.stderr).strip() or "(no output)")[:50000]
+    except Exception as e:
+        return f"Error: {e}"
 
 
-def run_write(inp: Dict[str, Any]) -> str:
-    fp = safe_path(inp.get("path"))
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    content = inp.get("content") or ""
-    if inp.get("mode") == "append" and fp.exists():
-        with fp.open("a") as f:
-            f.write(content)
-    else:
+def run_read(path: str, limit: int = None) -> str:
+    try:
+        lines = safe_path(path).read_text().splitlines()
+        if limit:
+            lines = lines[:limit]
+        return "\n".join(lines)[:50000]
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_write(path: str, content: str) -> str:
+    try:
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-    return f"wrote {len(content.encode())} bytes to {fp.relative_to(WORKDIR)}"
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
 
-def run_edit(inp: Dict[str, Any]) -> str:
-    fp = safe_path(inp.get("path"))
-    text = fp.read_text("utf-8")
-    action = inp.get("action")
-
-    if action == "replace":
-        find = str(inp.get("find") or "")
-        if not find:
-            raise ValueError("missing find")
-        result = text.replace(find, str(inp.get("replace") or ""))
-        fp.write_text(result)
-        return f"replaced in {fp.name}"
-
-    if action == "insert":
-        line_num = int(
-            inp.get("insert_after") if inp.get("insert_after") is not None else -1
-        )
-        rows = text.split("\n")
-        idx = max(-1, min(len(rows) - 1, line_num))
-        rows.insert(idx + 1, str(inp.get("new_text") or ""))
-        fp.write_text("\n".join(rows))
-        return f"inserted after line {line_num}"
-
-    if action == "delete_range":
-        rng = inp.get("range") or []
-        if len(rng) != 2:
-            raise ValueError("invalid range")
-        rows = text.split("\n")
-        fp.write_text("\n".join(rows[: rng[0]] + rows[rng[1] :]))
-        return f"deleted lines {rng[0]}-{rng[1]}"
-
-    raise ValueError(f"unknown action: {action}")
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        fp = safe_path(path)
+        text = fp.read_text()
+        if old_text not in text:
+            return f"Error: Text not found in {path}"
+        fp.write_text(text.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
 
-def run_todo_update(inp: Dict[str, Any]) -> str:
-    view = TODO_BOARD.update(inp.get("items") or [])
-    stats = TODO_BOARD.stats()
-    return view + f"\n\n({stats['completed']}/{stats['total']} completed)"
+def run_todo(items: list) -> str:
+    try:
+        return TODO.update(items)
+    except Exception as e:
+        return f"Error: {e}"
 
 
-# ============================================================================
-# SUBAGENT EXECUTION - The core of Task tool
-# ============================================================================
-def run_task(inp: Dict[str, Any], depth: int = 0) -> str:
+# =============================================================================
+# Subagent Execution - The heart of Task tool
+# =============================================================================
+def run_task(description: str, prompt: str, agent_type: str) -> str:
     """
-    Execute a subagent task. This is the heart of the subagent mechanism.
-
-    Key concepts:
-    1. Create isolated message history (subagent doesn't see parent conversation)
+    Execute a subagent task:
+    1. Create isolated message history
     2. Use agent-specific system prompt
-    3. Filter available tools based on agent type
-    4. Run the same query() loop recursively (in silent mode)
-    5. Extract and return only the final text response
-
-    Kode-style display:
-    - Subagent output does NOT appear in main chat
-    - Instead, a single progress line updates in place
-    - Only final summary is shown
+    3. Filter available tools
+    4. Run the same query loop
+    5. Return only final text
     """
-    global _current_subagent_progress
-
-    agent_type = inp.get("subagent_type")
-    prompt = inp.get("prompt")
-    description = inp.get("description", "subtask")
-
     if agent_type not in AGENT_TYPES:
-        raise ValueError(
-            f"Unknown agent type: {agent_type}. Available: {list(AGENT_TYPES.keys())}"
-        )
+        return f"Error: Unknown agent type '{agent_type}'"
 
-    agent_config = AGENT_TYPES[agent_type]
+    config = AGENT_TYPES[agent_type]
 
-    # 1. Get agent-specific system prompt
-    sub_system = (
-        f"You are a {agent_type} subagent operating in {WORKDIR}.\n"
-        f"{agent_config['system_prompt']}\n\n"
-        "Complete the task and provide a clear, concise summary."
-    )
+    # Agent-specific system prompt
+    sub_system = f"""You are a {agent_type} subagent at {WORKDIR}.
 
-    # 2. Get filtered tools for this agent type
+{config['prompt']}
+
+Complete the task and return a clear, concise summary."""
+
+    # Filtered tools for this agent type
     sub_tools = get_tools_for_agent(agent_type)
 
-    # 3. Create isolated message history (fresh start)
-    sub_messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    # Isolated message history (key: no parent context)
+    sub_messages = [{"role": "user", "content": prompt}]
 
-    # 4. Initialize progress tracker (Kode-style inline display)
-    progress = SubagentProgress(agent_type, description)
-    _current_subagent_progress = progress
+    # Progress display
+    print(f"  [{agent_type}] {description}")
+    start = time.time()
+    tool_count = 0
 
-    # 5. Run query loop in SILENT mode (depth > 0 triggers silent)
-    try:
-        result_messages = query(
+    # Run query loop (silent mode - don't print to main chat)
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            system=sub_system,
             messages=sub_messages,
-            system_prompt=sub_system,
-            available_tools=sub_tools,
-            depth=depth + 1,
-            silent=True,  # Key: suppress output to main chat
+            tools=sub_tools,
+            max_tokens=8000,
         )
-    finally:
-        # 6. Finalize progress display
-        summary = progress.finish()
-        _current_subagent_progress = None
-        print(summary)
 
-    # 7. Extract final assistant response
-    final_text = ""
-    for msg in reversed(result_messages):
-        if msg.get("role") == "assistant":
-            for block in msg.get("content", []):
-                if isinstance(block, dict) and block.get("type") == "text":
-                    final_text = block.get("text", "")
-                    break
-            if final_text:
-                break
+        if response.stop_reason != "tool_use":
+            break
 
-    return final_text or "(subagent returned no text)"
+        tool_calls = [b for b in response.content if b.type == "tool_use"]
+        results = []
 
+        for tc in tool_calls:
+            tool_count += 1
+            output = execute_tool(tc.name, tc.input)
+            results.append({"type": "tool_result", "tool_use_id": tc.id, "content": output})
 
-# ============================================================================
-# TOOL DISPATCHER
-# ============================================================================
-def dispatch_tool(
-    tool_use: Dict[str, Any], depth: int = 0, silent: bool = False
-) -> Dict[str, Any]:
-    """
-    Dispatch tool calls including Task for subagent spawning.
+            # Update progress line
+            elapsed = time.time() - start
+            sys.stdout.write(f"\r  [{agent_type}] {description} ... {tool_count} tools, {elapsed:.1f}s")
+            sys.stdout.flush()
 
-    In silent mode (for subagents):
-    - No output to main chat
-    - Updates progress tracker instead
-    """
-    name = (
-        tool_use.get("name")
-        if isinstance(tool_use, dict)
-        else getattr(tool_use, "name", None)
-    )
-    inp = (
-        tool_use.get("input", {})
-        if isinstance(tool_use, dict)
-        else getattr(tool_use, "input", {})
-    )
-    tool_id = (
-        tool_use.get("id")
-        if isinstance(tool_use, dict)
-        else getattr(tool_use, "id", None)
-    )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        sub_messages.append({"role": "user", "content": results})
 
-    def output(tool_name: str, tool_arg: str | None, result: str) -> None:
-        """Output handler: either print or update progress."""
-        if silent and _current_subagent_progress:
-            # Silent mode: update progress line
-            _current_subagent_progress.update(tool_name, tool_arg)
-        else:
-            # Normal mode: print to chat
-            pretty_tool_line(tool_name, tool_arg, depth)
-            pretty_sub_line(clamp_text(result, 500), depth)
+    # Clear progress line and print summary
+    elapsed = time.time() - start
+    sys.stdout.write(f"\r  [{agent_type}] {description} - done ({tool_count} tools, {elapsed:.1f}s)\n")
 
-    try:
-        if name == "bash":
-            result = run_bash(inp)
-            output("Bash", inp.get("command"), result)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
+    # Extract final text
+    for block in response.content:
+        if hasattr(block, "text"):
+            return block.text
 
-        if name == "read_file":
-            result = run_read(inp)
-            output("Read", inp.get("path"), result)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
-
-        if name == "write_file":
-            result = run_write(inp)
-            output("Write", inp.get("path"), result)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
-
-        if name == "edit_text":
-            result = run_edit(inp)
-            output("Edit", f"{inp.get('action')} {inp.get('path')}", result)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
-
-        if name == "TodoWrite":
-            result = run_todo_update(inp)
-            output("TodoWrite", None, result)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
-
-        # ===== TASK TOOL: Subagent spawning =====
-        if name == "Task":
-            # Task tool always prints its header (shows subagent spawn)
-            pretty_tool_line(
-                "Task", f"{inp.get('subagent_type')}: {inp.get('description')}", depth
-            )
-            result = run_task(inp, depth)
-            return {"type": "tool_result", "tool_use_id": tool_id, "content": result}
-
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": f"unknown tool: {name}",
-            "is_error": True,
-        }
-
-    except Exception as e:
-        if silent and _current_subagent_progress:
-            _current_subagent_progress.update(name, f"ERROR: {e}")
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": str(e),
-            "is_error": True,
-        }
+    return "(subagent returned no text)"
 
 
-# ============================================================================
-# QUERY LOOP - Now supports subagent context
-# ============================================================================
-def query(
-    messages: List[Dict[str, Any]],
-    system_prompt: Optional[str] = None,
-    available_tools: Optional[List[Dict[str, Any]]] = None,
-    depth: int = 0,
-    silent: bool = False,
-) -> List[Dict[str, Any]]:
-    """
-    Core query loop. Extended to support:
-    - Custom system_prompt (for subagents)
-    - Custom available_tools (filtered per agent type)
-    - depth tracking (for visual indentation)
-    - silent mode (for subagent execution - no output to main chat)
-    """
-    system = system_prompt or SYSTEM
-    tools = available_tools or ALL_TOOLS
+def execute_tool(name: str, input: dict) -> str:
+    """Dispatch tool call."""
+    if name == "bash":
+        return run_bash(input["command"])
+    elif name == "read_file":
+        return run_read(input["path"], input.get("limit"))
+    elif name == "write_file":
+        return run_write(input["path"], input["content"])
+    elif name == "edit_file":
+        return run_edit(input["path"], input["old_text"], input["new_text"])
+    elif name == "TodoWrite":
+        return run_todo(input["items"])
+    elif name == "Task":
+        return run_task(input["description"], input["prompt"], input["agent_type"])
+    return f"Unknown tool: {name}"
 
+
+# =============================================================================
+# Main Agent Loop
+# =============================================================================
+def agent_loop(messages: list) -> list:
     while True:
-        # In silent mode, use progress tracker instead of spinner
-        spinner = None
-        if not silent:
-            spinner = Spinner(f"{'  ' * depth}Agent thinking")
-            spinner.start()
-
-        try:
-            response = client.messages.create(
-                model=AGENT_MODEL,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=16000,
-            )
-        finally:
-            if spinner:
-                spinner.stop()
-
-        tool_uses = []
-        for block in getattr(response, "content", []) or []:
-            block_type = (
-                getattr(block, "type", None)
-                if not isinstance(block, dict)
-                else block.get("type")
-            )
-            if block_type == "text":
-                # Only print text in non-silent mode
-                if not silent:
-                    text = (
-                        getattr(block, "text", "")
-                        if not isinstance(block, dict)
-                        else block.get("text", "")
-                    )
-                    prefix = "  " * depth
-                    for line in text.split("\n"):
-                        print(f"{prefix}{format_markdown(line)}")
-            if block_type == "tool_use":
-                tool_uses.append(block)
-
-        if getattr(response, "stop_reason", None) == "tool_use":
-            # Pass silent flag to tool dispatcher
-            results = [dispatch_tool(tu, depth, silent) for tu in tool_uses]
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": normalize_content_list(response.content),
-                }
-            )
-            messages.append({"role": "user", "content": results})
-            continue
-
-        messages.append(
-            {"role": "assistant", "content": normalize_content_list(response.content)}
+        response = client.messages.create(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=ALL_TOOLS,
+            max_tokens=8000,
         )
-        return messages
+
+        tool_calls = []
+        for block in response.content:
+            if hasattr(block, "text"):
+                print(block.text)
+            if block.type == "tool_use":
+                tool_calls.append(block)
+
+        if response.stop_reason != "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            return messages
+
+        results = []
+        for tc in tool_calls:
+            # Task tool has special display handling
+            if tc.name == "Task":
+                print(f"\n> Task: {tc.input.get('description', 'subtask')}")
+            else:
+                print(f"\n> {tc.name}")
+
+            output = execute_tool(tc.name, tc.input)
+
+            # Don't print full Task output (it manages its own display)
+            if tc.name != "Task":
+                print(f"  {output[:200]}{'...' if len(output) > 200 else ''}")
+
+            results.append({"type": "tool_result", "tool_use_id": tc.id, "content": output})
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": results})
 
 
-# ============================================================================
-# MAIN LOOP
-# ============================================================================
-def main() -> None:
-    clear_screen()
-    render_banner("Tiny Kode Agent", "v3 with subagent support")
-    print(f"{INFO_COLOR}Workspace: {WORKDIR}{RESET}")
-    print(f"{INFO_COLOR}Agent types: {', '.join(AGENT_TYPES.keys())}{RESET}")
-    print(f'{INFO_COLOR}Type "exit" to quit.{RESET}\n')
+# =============================================================================
+# Main REPL
+# =============================================================================
+def main():
+    print(f"Mini Claude Code v3 (with Subagents) - {WORKDIR}")
+    print(f"Agent types: {', '.join(AGENT_TYPES.keys())}")
+    print("Type 'exit' to quit.\n")
 
-    history: List[Dict[str, Any]] = []
+    history = []
 
     while True:
         try:
-            line = input(user_prompt_label())
-        except EOFError:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
             break
 
-        if not line or line.strip().lower() in {"q", "quit", "exit"}:
+        if not user_input or user_input.lower() in ("exit", "quit", "q"):
             break
 
-        print()
-        history.append({"role": "user", "content": [{"type": "text", "text": line}]})
+        history.append({"role": "user", "content": user_input})
 
         try:
-            query(history)
+            agent_loop(history)
         except Exception as e:
-            print(f"{ACCENT_COLOR}Error: {e}{RESET}")
+            print(f"Error: {e}")
 
         print()
 
