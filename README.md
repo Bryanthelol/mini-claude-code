@@ -2,25 +2,20 @@
 
 [English](./README_en.md) | 中文
 
-> 生产级实现：[Kode - 开源 Agent CLI、 AI 编码 & AI 运维工具](https://github.com/shareAI-lab/Kode)
-
-<img width="360" height="360" alt="image" src="https://github.com/user-attachments/assets/9813fca0-a6dd-4813-972e-f9bf6d62add8" />
-
-关注我们在 X 上：https://x.com/baicai003
-
-<img height="450" alt="image" src="https://github.com/user-attachments/assets/0e1e31f8-064f-4908-92ce-121e2eb8d453" />
-
 ---
-
 ## 项目简介
 
 本仓库是一个**教学导向**的 Claude Code 核心机制复现项目。通过三个递进版本（约 900 行 Python），完整演示 AI 编程代理的关键设计模式：
+> 如果你追求一份开源的生产级实现：[Kode Agent - 开源 Agent CLI、 AI 编码 & AI 运维工具](https://github.com/shareAI-lab/Kode)
 
 | 版本 | 代码量 | 核心主题 | 学习目标 |
 |------|--------|----------|----------|
 | v1 | ~400 行 | Model as Agent | 理解工具循环的本质 |
 | v2 | +170 行 | 结构化规划 | 掌握 Todo 工具与系统提醒 |
 | v3 | +150 行 | 子代理机制 | 学会 Task 工具与上下文隔离 |
+
+
+<img height="520" alt="image" src="https://github.com/user-attachments/assets/0e1e31f8-064f-4908-92ce-121e2eb8d453" />
 
 ## 快速开始
 
