@@ -4,11 +4,13 @@
 
 [English](./README.md)
 
+> 兼容 **[Kode CLI](https://github.com/anthropics/kode)**、**Claude Code**、**Cursor**，以及任何支持 [Agent Skills Spec](https://github.com/anthropics/agent-skills) 的 Agent。
+
 <img height="400" alt="demo" src="https://github.com/user-attachments/assets/0e1e31f8-064f-4908-92ce-121e2eb8d453" />
 
 ## 这是什么？
 
-一个渐进式教程，揭开 Claude Code、Cursor Agent、Codex CLI 等 AI Agent 的神秘面纱。
+一个渐进式教程，揭开 Kode、Claude Code、Cursor Agent 等 AI Agent 的神秘面纱。
 
 **5 个版本，总共约 1100 行，每个版本只添加一个概念：**
 
@@ -63,10 +65,6 @@ mini-claude-code/
 ├── v3_subagent.py         # ~450 行: + Task 工具，代理注册表
 ├── v4_skills_agent.py     # ~550 行: + Skill 工具，SkillLoader
 ├── skills/                # 示例 Skills（用于学习）
-│   ├── agent-builder/     # 元技能：教 Agent 如何构建 Agent
-│   ├── pdf/               # PDF 处理
-│   ├── mcp-builder/       # MCP 服务器创建
-│   └── code-review/       # 代码审查专业知识
 └── docs/                  # 详细文档 (中英双语)
 ```
 
@@ -83,15 +81,17 @@ python skills/agent-builder/scripts/init_agent.py my-agent --level 0  # 极简
 python skills/agent-builder/scripts/init_agent.py my-agent --level 1  # 4 工具 (默认)
 ```
 
-### 作为 Claude Code 插件安装
-
-生产环境请从我们专门的 skills 仓库安装：
+### 生产环境安装 Skills
 
 ```bash
+# Kode CLI（推荐）
+kode plugins install https://github.com/shareAI-lab/shareAI-skills
+
+# Claude Code
 claude plugins install https://github.com/shareAI-lab/shareAI-skills
 ```
 
-详见 [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) 获取完整的 skills 集合。
+详见 [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) 获取完整的生产就绪 skills 集合。
 
 ## 核心概念
 
@@ -130,6 +130,7 @@ SKILL.md 文件按需提供领域专业知识。知识作为一等公民。
 
 | 仓库 | 用途 |
 |------|------|
+| [Kode](https://github.com/anthropics/kode) | 全功能开源 Agent CLI（生产环境） |
 | [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) | 生产就绪的 AI Agent Skills |
 | [Agent Skills Spec](https://github.com/anthropics/agent-skills) | 官方规范 |
 
@@ -144,17 +145,11 @@ cd mini-claude-code
 cp v1_basic_agent.py my_agent.py
 ```
 
-## 生产版本
-
-这是学习用的。生产环境请使用：
-
-**[Kode](https://github.com/anthropics/kode)** - 全功能开源 Claude Code
-
 ## 设计哲学
 
 > 模型是 80%，代码是 20%。
 
-Claude Code 能工作，不是因为巧妙的工程，而是因为模型被训练成了 Agent。我们的工作就是给它工具，然后闪开。
+Kode 和 Claude Code 能工作，不是因为巧妙的工程，而是因为模型被训练成了 Agent。我们的工作就是给它工具，然后闪开。
 
 ## License
 

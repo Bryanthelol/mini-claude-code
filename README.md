@@ -4,11 +4,13 @@
 
 [中文文档](./README_zh.md)
 
+> Works with **[Kode CLI](https://github.com/anthropics/kode)**, **Claude Code**, **Cursor**, and any agent supporting the [Agent Skills Spec](https://github.com/anthropics/agent-skills).
+
 <img height="400" alt="demo" src="https://github.com/user-attachments/assets/0e1e31f8-064f-4908-92ce-121e2eb8d453" />
 
 ## What is this?
 
-A progressive tutorial that demystifies AI coding agents like Claude Code, Cursor Agent, and Codex CLI.
+A progressive tutorial that demystifies AI coding agents like Kode, Claude Code, and Cursor Agent.
 
 **5 versions, ~1100 lines total, each adding one concept:**
 
@@ -63,10 +65,6 @@ mini-claude-code/
 ├── v3_subagent.py         # ~450 lines: + Task tool, agent registry
 ├── v4_skills_agent.py     # ~550 lines: + Skill tool, SkillLoader
 ├── skills/                # Example skills (for learning)
-│   ├── agent-builder/     # Meta-skill: teaches how to build agents
-│   ├── pdf/               # PDF processing
-│   ├── mcp-builder/       # MCP server creation
-│   └── code-review/       # Code review expertise
 └── docs/                  # Detailed explanations (EN + ZH)
 ```
 
@@ -83,15 +81,17 @@ python skills/agent-builder/scripts/init_agent.py my-agent --level 0  # Minimal
 python skills/agent-builder/scripts/init_agent.py my-agent --level 1  # 4 tools (default)
 ```
 
-### Installing as a Claude Code Plugin
-
-For production use, install skills from our dedicated skills repository:
+### Install Skills for Production Use
 
 ```bash
+# Kode CLI (recommended)
+kode plugins install https://github.com/shareAI-lab/shareAI-skills
+
+# Claude Code
 claude plugins install https://github.com/shareAI-lab/shareAI-skills
 ```
 
-See [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) for the full collection of skills.
+See [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) for the full collection of production-ready skills.
 
 ## Key Concepts
 
@@ -130,6 +130,7 @@ SKILL.md files provide domain expertise on-demand. Knowledge as a first-class ci
 
 | Repository | Purpose |
 |------------|---------|
+| [Kode](https://github.com/anthropics/kode) | Full-featured open source agent CLI (production) |
 | [shareAI-skills](https://github.com/shareAI-lab/shareAI-skills) | Production-ready skills for AI agents |
 | [Agent Skills Spec](https://github.com/anthropics/agent-skills) | Official specification |
 
@@ -144,17 +145,11 @@ cd mini-claude-code
 cp v1_basic_agent.py my_agent.py
 ```
 
-## Production Version
-
-This is for learning. For production use:
-
-**[Kode](https://github.com/anthropics/kode)** - Full-featured open source Claude Code
-
 ## Philosophy
 
 > The model is 80%. Code is 20%.
 
-Claude Code works not because of clever engineering, but because the model is trained to be an agent. Our job is to give it tools and stay out of the way.
+Kode and Claude Code work not because of clever engineering, but because the model is trained to be an agent. Our job is to give it tools and stay out of the way.
 
 ## License
 
